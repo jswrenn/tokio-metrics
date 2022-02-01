@@ -1,11 +1,15 @@
+use once_cell::sync::OnceCell;
 use futures_util::task::{ArcWake, AtomicWaker};
 use pin_project_lite::pin_project;
 use std::future::Future;
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tracking_allocator::{AllocationGroupToken, AllocationGroupId};
+use dashmap::DashMap;
 
 pub struct TaskMetrics {
     metrics: Arc<Metrics>,
@@ -16,6 +20,9 @@ pin_project! {
         // The task being instrumented
         #[pin]
         task: T,
+
+        // The allocation group associated with this task.
+        allocation_group: Option<ManuallyDrop<AllocationGroupToken>>,
 
         // True when the task is polled for the first time
         did_poll_once: bool,
@@ -56,7 +63,7 @@ pub struct Sample {
 }
 
 /// Tracks the metrics, shared across the various types.
-struct Metrics {
+pub(crate) struct Metrics {
     /// A task poll takes longer than this, it is considered a slow poll.
     slow_poll_cut_off: Duration,
 
@@ -83,6 +90,12 @@ struct Metrics {
 
     /// Total amount of time a task has spent being polled above the slow cut off.
     total_time_slow_poll: AtomicU64,
+
+    /// Total number of bytes allocated by a task.
+    pub(crate) bytes_allocated: AtomicU64,
+
+    /// Total number of bytes freed by a task.
+    pub(crate) bytes_freed: AtomicU64,
 }
 
 struct State {
@@ -117,13 +130,20 @@ impl TaskMetrics {
                 total_time_scheduled: AtomicU64::new(0),
                 total_time_fast_poll: AtomicU64::new(0),
                 total_time_slow_poll: AtomicU64::new(0),
+                bytes_allocated: AtomicU64::new(0),
+                bytes_freed: AtomicU64::new(0),
             }),
         }
     }
 
     pub fn instrument<F: Future>(&self, task: F) -> InstrumentedTask<F> {
+        let info = crate::allocations::ALLOCATION_INFO.get_or_init(Default::default);
+        let allocation_group = AllocationGroupToken::acquire();
+        let allocation_group_id = allocation_group.id();
+        info.group_to_metrics.insert(allocation_group_id, self.metrics.clone());
         InstrumentedTask {
             task,
+            allocation_group: Some(ManuallyDrop::new(allocation_group)),
             did_poll_once: false,
             state: Arc::new(State {
                 metrics: self.metrics.clone(),
@@ -166,6 +186,16 @@ impl TaskMetrics {
         Duration::from_nanos(nanos)
     }
 
+    /// Total number of bytes that instrumented tasks allocated.
+    pub fn total_bytes_allocated(&self) -> u64 {
+        self.metrics.bytes_allocated.load(SeqCst)
+    }
+
+    /// Total number of bytes that instrumented tasks freed.
+    pub fn total_bytes_freed(&self) -> u64 {
+        self.metrics.bytes_freed.load(SeqCst)
+    }
+
     /// An iterator that samples the change in metrics each iteration.
     pub fn sample(&self) -> impl Iterator<Item = Sample> {
         struct Iter(Arc<Metrics>, Option<Sample>);
@@ -191,6 +221,7 @@ impl TaskMetrics {
                     total_time_slow_poll: Duration::from_nanos(
                         self.0.total_time_slow_poll.load(SeqCst),
                     ),
+                    
                 };
 
                 let ret = if let Some(prev) = self.1 {
@@ -292,7 +323,9 @@ impl<T: Future> Future for InstrumentedTask<T> {
 
         // Poll the task
         let now = Instant::now();
+        let allocation_guard = ManuallyDrop::into_inner(this.allocation_group.take().unwrap()).enter();
         let ret = Future::poll(this.task, &mut cx);
+        *this.allocation_group = Some(ManuallyDrop::new(allocation_guard.exit()));
         this.state.measure_poll_time(now.elapsed());
         ret
     }

@@ -15,3 +15,5 @@ cfg_rt! {
 
 pub mod task;
 pub use task::{InstrumentedTask, TaskMetrics};
+
+pub mod allocations;

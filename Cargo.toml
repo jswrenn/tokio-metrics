@@ -9,10 +9,13 @@ edition = "2021"
 rt = ["tokio"]
 
 [dependencies]
+dashmap = "5.0.0"
+once_cell = "1.9.0"
 futures-util = "0.3.19"
 pin-project-lite = "0.2.7"
+tracking-allocator = { path = "../tracking-allocator" }
 
-tokio = { version = "1.15.0", features = ["rt", "stats"], optional = true }
+tokio = { version = "1.15.0", features = ["rt", "sync", "stats"], optional = true }
 
 [patch.crates-io]
-tokio = { path = "../tokio/tokio" }
+tokio = { git = "https://github.com/tokio-rs/tokio", branch = "master" }
